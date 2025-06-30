@@ -1,0 +1,240 @@
+# Identifying Tumor Core and Comparing to Healthy Sample post-integration
+
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+library(magrittr)
+library(patchwork)
+
+merged <- readRDS("/Users/chandlercoate/Downloads/GSE220978_OSCC_GSE206621_Healthy_integrate_seed_1.rds")
+
+merged@meta.data <- merged@meta.data %>%
+  mutate(diagnosis = case_when(
+    grepl("Healthy", sample_id) ~ "Healthy",
+    grepl("OSCC", sample_id) ~ "OSCC"
+  ))
+
+Idents(merged) <- "diagnosis"  # Set your new column as active identity
+
+table(merged$diagnosis)
+
+DefaultAssay(merged) <- "integrated"
+
+merged_OSCC <- subset(merged, subset = diagnosis == "OSCC")
+
+merged_OSCC <- RunPCA(merged_OSCC, dims = 1:75)
+merged_OSCC <- FindNeighbors(merged_OSCC, dims = 1:50, k.param = 20, verbose = TRUE)
+merged_OSCC <- FindClusters(merged_OSCC, resolution = 0.4, algorithm = 4, verbose = FALSE, graph.name = "integrated_snn", random.seed = 1)
+merged_OSCC <- RunUMAP(merged_OSCC, dims = 1:50, verbose = FALSE)
+
+table(merged_OSCC$seurat_clusters)
+
+OSCC_markers <- FindAllMarkers(merged_OSCC, assay = "integrated")
+
+hnscc_markers <- c("CDH3", "COL17A1", "PLEK2", "SLC7A5", "PVRL1", "SDC1", "SLC2A1", 
+                   "ULBP2", "DSG3", "CLCA2", "IGSF3", "LY6K", "CDCP1", "GJB2", "LY6D",   
+                   "LGALS1", "LGALS3", "CLDN4", "TACSTD2", "CD276", "SIRPA", "NECTIN4")
+valid_genes <- hnscc_markers[hnscc_markers %in% rownames(merged_OSCC[["integrated"]]@data)]
+
+DoHeatmap(
+  merged_OSCC,
+  features = valid_genes,
+  disp.min = -3,
+  disp.max = 3,
+  slot = "scale.data",
+  group.by = "seurat_clusters",
+  draw.lines = TRUE
+) +
+  ggtitle(paste0("Expression by Cluster")) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  guides(color = "none")
+
+tumor_core_markers <- c("SPRR2E", "CRCT1", "SPRR2D", "CNFN", "SPRR1A", "SPRR2A", "SLURP2", "LCE3D", "SPRR2B", "SPRR3", 
+                        "SLURP1", "SPRR2G", "S100A12", "LCN2", "FAM25A", "PI3", "KLK6", "DEFB4A", "SPRR1B", "S100A7", 
+                        "LCE3E", "CSTA", "KLK7", "SBSN", "KLK13")
+leading_edge_markers <- c("LAMC2", "ITGA5", "PFN1", "RPS23", "RPL4", "RPL34", "PKM", "RPS27A", "MT1X", "VIM", "RPL11", "ATP1A1", 
+                          "PTMA", "RPS2", "RPL5", "RPS4X", "TUBB", "MIR205HG", "TUBA1B", "RPL17", "RPL22", 
+                          "HNRNPA2B1", "COL1A2", "IFITM3", "NME2", "MT2A", "COL1A1")
+
+core_marker_df <- subset(OSCC_markers, OSCC_markers$gene %in% tumor_core_markers)
+le_marker_def <- subset(OSCC_markers, OSCC_markers$gene %in% leading_edge_markers)
+
+DoHeatmap(
+  merged_OSCC,
+  features = tumor_core_markers,
+  disp.min = -3,
+  disp.max = 3,
+  slot = "scale.data",
+  group.by = "seurat_clusters",
+  draw.lines = TRUE
+) +
+  ggtitle(paste0("Expression Core Tumor Markers by Cluster")) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  guides(color = "none")
+
+clust6_merged <- subset(merged_OSCC, subset = seurat_clusters == "6")
+clust6_merged$identity <- "core"
+merged_health <- subset(merged, subset = diagnosis == "Healthy")
+merged_health$identity <- "Healthy"
+
+core_v_health <- merge(clust6_merged, merged_health)
+table(core_v_health$identity)
+
+Idents(core_v_health) <- "identity"
+
+cvh_markers <- FindMarkers(core_v_health, ident.1 = "core", ident.2 = "Healthy", assay = "integrated")
+cvh_markers$gene <- rownames(cvh_markers)
+
+# Plots ####
+cvh_hnscc_subset <- subset(cvh_markers, cvh_markers$gene %in% hnscc_markers)
+
+# Volcano plot
+# build your volcano data frame first:
+vol <- cvh_hnscc_subset %>%
+  mutate(
+    sig = case_when(
+      p_val_adj < 0.05 & avg_log2FC >  1  ~ "Up",
+      p_val_adj < 0.05 & avg_log2FC < -1  ~ "Down",
+      TRUE                                ~ "NS"
+    )
+  )
+
+p_vol <- ggplot(vol, aes(x = avg_log2FC, y = -log10(p_val_adj), colour = sig)) +
+  geom_point(alpha = 0.6) +
+  scale_colour_manual(
+    values = c(Up = "firebrick", Down = "steelblue", NS = "gray70")
+  ) +
+  geom_vline(xintercept = c(-1,1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  theme_minimal(base_size = 14) +
+  labs(
+    x = expression(Log[2]~fold~change),
+    y = expression(-Log[10]~adjusted~P),
+    colour = NULL
+  )
+
+to_label_vol <- vol %>%
+  #filter(p_val_adj < 0.05, abs(avg_log2FC) > 1) %>%
+  group_by(gene) %>%
+  #slice_max(order_by = abs(avg_log2FC), n = 1) %>%
+  ungroup()
+
+p_vol + 
+  geom_text_repel(
+    data = to_label_vol,
+    aes(label = gene),
+    size        = 3,
+    box.padding = 0.3,
+    max.overlaps = 20
+  )
+
+save(p_vol, file = "./vol_ma_6.27.25/vol_June_27.RData")
+
+# MA plot
+
+# 3) MA plot
+# here we approximate average expression by (pct.1 + pct.2)/2
+# make sure you have 'A' and 'M' and 'sig' in your data:
+ma_df <- cvh_hnscc_subset %>%
+  mutate(
+    A   = log2(((pct.1 + pct.2)/2) + 1),
+    M   = avg_log2FC,
+    sig = case_when(
+      p_val_adj < 0.05 & avg_log2FC >  1  ~ "Up",
+      p_val_adj < 0.05 & avg_log2FC < -1  ~ "Down",
+      TRUE                                ~ "NS"
+    )
+  )
+
+p_ma <- ggplot(ma_df, aes(x = A, y = M, colour = sig)) +
+  geom_point(alpha = 0.6) +
+  scale_colour_manual(
+    values = c(Up = "firebrick", Down = "steelblue", NS = "gray70")
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_minimal(base_size = 14) +
+  labs(
+    x = expression(Log[2]~mean~expression),
+    y = expression(Average~Log[2]~fold~change),
+    colour = NULL
+  )
+
+# pick points to label—e.g. only the significant ones
+to_label_ma <- ma_df %>%
+  #filter(p_val_adj < 0.05, abs(M) > 1) %>%
+  group_by(gene) %>%
+  #slice_max(order_by = abs(M), n = 1) %>%
+  ungroup()
+
+p_ma +
+  geom_text_repel(
+    data = to_label_ma,
+    aes(label = gene),
+    size        = 3,
+    box.padding = 0.3,
+    max.overlaps = 20
+  )
+
+save(p_ma, file = "./vol_ma_6.27.25/ma_June_27.RData")
+
+
+# Violin
+DefaultAssay(merged) <- "integrated"
+valid_genes <- hnscc_markers[hnscc_markers %in% rownames(core_v_health[["integrated"]]@data)]
+expr_values <- FetchData(object = core_v_health, vars = valid_genes)
+y_max_val <- max(expr_values, na.rm = TRUE)
+y_min_val <- min(expr_values, na.rm = TRUE)
+
+vln_list <- lapply(valid_genes, function(gene) {
+  VlnPlot(core_v_health, group.by = "identity", features = gene, assay = "integrated", layer = "data", pt.size = FALSE) +
+    scale_fill_manual(values = c("Healthy" = "lightblue", "core" = "red")) +
+    theme(legend.position = "none",
+          plot.title = element_text(size = 10),
+          axis.title.x = element_text(size = 5),
+          axis.title.y = element_text(size = 10),
+          axis.text.x = element_text(size = 9, angle = 0, hjust = 0.5)) +
+    scale_y_continuous(limits = c(0, y_max_val)) +
+    ggtitle(gene)
+})
+vln_combined <- wrap_plots(vln_list, ncol = 4) +
+  plot_annotation(title = "Violin Plot Malignancy")
+
+# Heatmap
+assay = "integrated"
+valid_genes <- hnscc_markers[hnscc_markers %in% rownames(merged[["integrated"]]@data)]
+DoHeatmap(
+  merged,
+  features = valid_genes,
+  disp.min = -3,
+  disp.max = 3,
+  slot = "scale.data",
+  group.by = "diagnosis",
+  draw.lines = TRUE
+) +
+  ggtitle(paste0("Expression by Cluster")) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  guides(color = "none")
+
+# ────────────── Ridge Plot ──────────────
+global_limits <- core_v_health@misc$global_expression_limits
+
+ridge_list <- lapply(valid_genes, function(gene) {
+  RidgePlot(core_v_health, features = gene, assay = "integrated", layer = "scale.data") +
+    scale_fill_manual(values = c("Healthy" = "lightblue", "core" = "red")) +
+    coord_cartesian(xlim = global_limits) +
+    ggtitle(gene) +
+    labs(x = "Expression", y = "Diagnosis") +
+    theme_minimal() +
+    theme(
+      axis.text.x     = element_text(angle = 45, hjust = 1),
+      plot.title      = element_text(hjust = 0.5, face = "bold"),
+      legend.position = "none"
+    )
+})
+ridge_combined <- patchwork::wrap_plots(ridge_list, ncol = 4) +
+  patchwork::plot_annotation(title = paste0("Ridge", " Integrated"))
+ggsave(
+  file.path(output_sample_path, paste0("Combined_Ridge_", file_label, ".png")),
+  plot   = ridge_combined,
+  width  = 16, height = 10, dpi = 600, bg = "transparent"
+)
